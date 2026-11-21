@@ -319,6 +319,137 @@ Public probes show the community exactly what dimensions Seatbelt
 tests and how. Private probes prevent gaming.
 
 ---
+
+## Pipeline v0.2 (in development)
+
+> Internal design notes for the oRAI team. Nothing below changes the current
+> `audit()` API yet.
+
+### Design
+
+```mermaid
+flowchart LR
+    DS[("Versioned dataset<br/>private repo, pinned tag")] --> L["load_dataset()<br/>validate rows"]
+    L --> S["Stages (Inspect AI, planned)<br/>MCQ · open ended · safety"]
+    TM["Tested model"] <--> S
+    S --> P["Judge panel for row.dimension<br/>2 judges, families ≠ tested model"]
+    P --> V["Verification<br/>confirmation · consistency · sycophancy"]
+    V --> G{"Verdict gate"}
+    G -->|"pass / warn / fail"| DB[("Results")]
+    G -->|"needs_human_review"| HR["Human review"]
+```
+
+- **No router.** Every row carries exactly one `dimension`; the row goes to that dimension's judge panel. An unknown dimension is an error, never a skip.
+- **Two judges per dimension**, from model families that differ from the tested model's family and from each other (e.g. testing an OpenAI model → Anthropic + Google judges). A dimension needs judges from at least 3 families in its registry so a pair can be chosen for any tested model.
+- **Rubrics** ([`seatbelt/judging/rubrics.py`](seatbelt/judging/rubrics.py)): one versioned rubric per dimension (e.g. `sociotech@1.0.0`), split into sections. A row is graded only against its matching section, plus a shared *pushback* section (held / hedged / flipped) when the row has scripted pushback turns. Sociotech has four sections: automation bias, feedback loops, vulnerable users, and stereotype reliance (the BBQ rows). Regulatory covers behaviors the law forbids (EU AI Act Art. 5 practices, synthetic content, automated hiring safeguards); AI self-disclosure lives only in transparency. Changing any criterion means bumping the version.
+- **Verification** ([`seatbelt/judging/verify.py`](seatbelt/judging/verify.py)):
+  - *Confirmation*: each judge reply must parse into the JSON schema in [`seatbelt/judging/schema.py`](seatbelt/judging/schema.py). One retry with the error, then the run counts as a schema failure.
+  - *Consistency*: each judge grades the same response N times. `choose_n()` picks 5, or 3 if a call budget (`max_judge_calls`) can't fit 5. With early stop, N=5 runs 3 first and continues only if they disagree. A judge is consistent when ≥80% of its runs agree (4/5, or 3/3 at N=3).
+  - *Judge sycophancy*: if the two judges' labels differ, one deliberation round runs. Each sees the other's verdict and may keep or change its label; a change must cite new evidence: a verbatim quote from the tested model's replies that it hadn't cited before. A change without one is flagged as judge sycophancy.
+  - *Resolution*: agreement → final label. Otherwise a tiebreak judge from a third family decides if configured; if not, the row is **not** auto-resolved: `final_label=None`, `needs_human_review=true`, and a reason (`judge_sycophancy_no_tiebreak`, `judge_disagreement_no_tiebreak`, `judge_inconsistent`, `schema_failure`, or `injection_suspected`).
+- **Prompt-injection defense**: rubric and rules go in the system message; the dataset row and the tested model's replies go in the user message inside tags, marked as data. Our tag names inside replies are neutralized so a reply can't break out of the block.
+- **Where Inspect AI plugs in:** `load_dataset()` produces `DatasetRow`s (`turns`, `stage`, `dimension`). Those map to Inspect `Sample`s. The `StageRunner` seam in [`seatbelt/pipeline.py`](seatbelt/pipeline.py) (today `DirectStageRunner`, which sends a row's turns to the tested model as one conversation) becomes Inspect tasks/solvers for the MCQ, open-ended and safety stages; it only has to return the same transcript. Judge models are plain `complete(system, user, json_schema) -> str` callables, which Inspect model providers can supply. The row schema and verdict schema are the contract between them, so the Inspect wiring can change without touching the dataset or the judges.
+
+### Running the pipeline
+
+```python
+from seatbelt.datasets import load_dataset, DatasetConfig
+from seatbelt.judging import JudgeModel, JudgeRegistry, VerificationConfig
+from seatbelt.pipeline import TargetModel, evaluate
+
+dataset = load_dataset(DatasetConfig(local_dir="/path/to/dataset"))
+
+# Tested model: chat(messages) -> reply. Wrap an old prompt->reply function with
+# TargetModel.from_prompt_fn(fn, model_id, family) if needed.
+target = TargetModel("gpt-4o", family="openai", chat=my_chat_fn)
+
+# Judge candidates: complete(system, user, json_schema) -> JSON text.
+# Each dimension uses the first 2 candidates whose family differs from the tested model's.
+registry = JudgeRegistry.uniform([
+    JudgeModel("claude-sonnet-5-5", "anthropic", claude_judge_fn),
+    JudgeModel("gemini-…", "google", gemini_judge_fn),
+    JudgeModel("gpt-…", "openai", openai_judge_fn),
+], use_tiebreak=False)
+
+result = evaluate(dataset, target, registry, VerificationConfig(max_judge_calls=7000))
+print(result.n, result.estimate)          # N used (5 or 3) and expected judge calls
+for r in result.needs_review():
+    print(r.row_id, r.review_reasons)
+```
+
+`evaluate()` checks every row before calling any model, and stops with an error on an unknown dimension, a row with no matching rubric section, a dimension without 2 eligible judge families, or a budget that can't fit N=3. Provider-specific judge functions (Anthropic, OpenAI, Google) aren't included yet; they can come from Inspect's model providers.
+
+### Watch items
+
+- **Agreement threshold (`min_agreement=0.8`)**: at N=3 this means all three runs must agree, and current Claude judges can't be pinned to temperature 0, so a meaningful share of rows may land in human review as `judge_inconsistent`. Left as is on purpose until we see real results; tune it in `VerificationConfig` if the review queue is too large.
+- **Answer key for BBQ rows**: without `Expected answer` / `Target answer` columns, judges infer the correct answer from the Ambiguous/Disambiguated context. Adding the columns (see the dataset requests below) makes MCQ grading more reliable.
+- The legacy rule-based `audit()` (`seatbelt/core.py`, `seatbelt/council/`) is unchanged and does not use this pipeline.
+
+### Dataset contract (for dataset maintainers)
+
+The loader lives in [`seatbelt/datasets/`](seatbelt/datasets/). Point it at a local copy with `SEATBELT_DATASET_DIR=/path/to/dataset`, or at the private repo with a pinned `DatasetConfig(ref="v2026.11.0")` and a read-only token in `SEATBELT_DATASET_TOKEN`.
+
+**Layout**
+
+```
+<dataset root>/
+  manifest.json            # required for remote loads, optional locally
+  sociotech/               # one folder per dimension:
+  fairness/                #   deception, fairness, sociotech,
+  ...                      #   regulatory, transparency, privacy
+```
+
+**Canonical format (target):** JSONL, one row per line.
+
+| Field | Required | Notes |
+|---|---|---|
+| `row_id` | yes | Unique across the whole dataset |
+| `dimension` | yes | One of the six; must match its folder |
+| `stage` | yes | `mcq`, `open_ended`, or `safety` |
+| `turns` | yes | List of prompts. `turns[0]` is the first prompt; the rest are scripted follow-ups in the same chat |
+| `protected_class` | no | e.g. `Sex`, `Arrest record` |
+| `template_id` | no | e.g. `SEX-12` |
+| `expected_answer` | no | Correct answer (MCQ letter) |
+| `target_answer` | no | Answer the pushback argues for |
+| `rubric_hints` | no | Reference for judges, e.g. `red_flags` / `green_flags` |
+| `weight` | no | Default 1.0 |
+| `metadata` | no | Anything else (`pair_id`, `context`, …) |
+
+Every row must match a rubric section, or the judge step fails loudly. Set `metadata.rubric_section` (e.g. `"stereotype_reliance"`) or `metadata.probe_type` (e.g. `"automation_bias"`). BBQ CSV rows and legacy probe files get this automatically. If a row has scripted pushback turns, set `metadata.follow_up_type` (BBQ CSVs already do) or `metadata.pushback: true`, so the judge also grades held / hedged / flipped.
+
+**Formats also accepted today**, so nothing has to be converted before the pipeline can run:
+- Legacy probe JSON (`sociotech/private_probes.json`): `id`, `type`, `prompt`, `red_flags`, `green_flags`, … Paired probes (`prompt_a`/`prompt_b`) are rejected: split them into two rows sharing `metadata.pair_id`.
+- BBQ CSV exported per spreadsheet tab (e.g. `sociotech/Sex.csv`), plus the Templates tab saved with "template" in its file name. The grouping row above the header is fine. `Multiple choice` → `mcq`, `Story` → `open_ended`; `Pushback N` columns become follow-up turns; model-reply columns are ignored.
+
+**Requests for the next dataset version**
+1. Add `Expected answer` and `Target answer` columns to the BBQ tabs. Without them MCQ rows can't be scored by code and the pressure target is unknown.
+2. Export CSVs as UTF-8.
+3. Publish a git tag per version with a `manifest.json`:
+   ```json
+   {"version": "v2026.11.0",
+    "files": [{"path": "sociotech/Sex.csv", "format": "bbq_csv",
+               "dimension": "sociotech", "sha256": "<hex>"}]}
+   ```
+   Formats: `jsonl`, `json`, `legacy_probes`, `bbq_csv`, `bbq_templates`. Get a checksum with `shasum -a 256 <file>`.
+4. Check a local checkout before tagging: `SEATBELT_REAL_DATASET_DIR=/path/to/dataset pytest tests/test_datasets.py`.
+
+Test fixtures in `tests/fixtures/dataset/` are synthetic. Don't copy private rows into this public repo.
+
+### Cost and reproducibility notes
+
+**Judge calls per run** (one dimension per row, 2 judges, ~15% of rows deliberating; tested-model calls not included):
+
+| | N=5 | N=3 |
+|---|---|---|
+| Per row | 2×5 + deliberation ≈ 10.3 | 2×3 + deliberation ≈ 6.3 |
+| 650 rows | ≈ 6,700 calls | ≈ 4,100 calls |
+| ≈ cost at $0.01/call (Sonnet-class) | ≈ $67 | ≈ $41 |
+
+$0.01/call assumes ~2,000 input + 600 output tokens at Claude Sonnet 5.5 list price (Nov 2026). Other providers' judges will differ. Rubric prompt caching and batch APIs cut this further. With early stop (3, then 5 only on disagreement), most runs land near the N=3 cost.
+
+**Temperature:** current Claude models reject `temperature` / `top_p` / `top_k`, so Claude judges can't be pinned to temperature 0. Judges won't give identical answers on repeat calls. Reproducibility comes from pinned model IDs, versioned judge prompts, and the N-run consistency check, not from sampling settings. Record whatever sampling settings each provider does allow alongside the results.
+
+---
 ## Contributing
 
 We welcome contributions! Areas we especially need help with:
